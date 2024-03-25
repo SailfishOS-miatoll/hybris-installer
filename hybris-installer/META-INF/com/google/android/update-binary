@@ -12,7 +12,7 @@
 
 OUTFD="/proc/self/fd/$2" # e.g. "/proc/self/fd/28"
 ZIPFILE="$3"             # e.g. "/sdcard/%DST_PKG%.zip"
-FILES="/tmp/hybris-installer"
+FILES="/data/hybris-installer"
 
 # Set progress bar percentage using a fraction ($1) in range 0.00 - 1.00
 set_progress() { echo -e "set_progress $1\n" > $OUTFD; }
@@ -23,8 +23,8 @@ ui_print() { [ -z "$1" ] && echo -e "ui_print  \nui_print" > $OUTFD || echo -e "
 # Log some text ($1) for script debugging
 log() { echo "hybris-installer: $@"; }
 
-# Remove package residue files from /tmp and unmount partitions
-cleanup() { log "Cleaning up..."; umount /system; rm -rf $FILES/; }
+# Remove package residue files from /data
+cleanup() { log "Cleaning up..."; rm -rf $FILES/; }
 
 # Before quitting with an exit code ($1), show a message ($2)
 abort() { ui_print "E$1: $2"; cleanup; exit $1; }
@@ -39,36 +39,15 @@ CURRENT_DEVICE=`getprop ro.product.device`
 START_SECS=`date +'%s'`
 ROOT="/data/.stowaways/sailfishos"
 FORCE_REINSTALL=0
-PARTITION_PREFIX="/dev/block/bootdevice/by-name"
+PARTITION_PREFIX="/dev/block/by-name"
 PARTITION_BOOT="$PARTITION_PREFIX/boot"
-PARTITION_VENDOR="$PARTITION_PREFIX/vendor"
-PARTITION_PERSIST="$PARTITION_PREFIX/persist"
+PARTITION_DTBO="$PARTITION_PREFIX/dtbo"
 
 # >>> Sanity checks >>>
 
 # Device
-[ "$CURRENT_DEVICE" != "$TARGET_DEVICE" ] && abort 7 "This package is for '$TARGET_DEVICE' devices; this is a '$CURRENT_DEVICE'."
+# [ "$CURRENT_DEVICE" != "$TARGET_DEVICE" ] && abort 7 "This package is for '$TARGET_DEVICE' devices; this is a '$CURRENT_DEVICE'."
 
-# ext4 check for /data (& /cache)
-(mount | grep -q /cache || mount /cache) &&
-	(mount | grep -q "/cache.*ext4" || abort 1 "Cache is NOT formatted as ext4; check out 'Wipe > Advanced' from TWRP!") ||
-	log "Couldn't mount /cache! Is this an A/B device by any chance?"
-(mount | grep -q /data || mount /data) || abort 2 "Couldn't mount /data; running e2fsck and rebooting may help."
-mount | grep -q "/data.*ext4" || abort 3 "Data is NOT formatted as ext4; check out 'Wipe > Advanced' from TWRP!"
-
-# Treble
-[ -r $PARTITION_VENDOR ] || abort 4 "A vendor partition doesn't exist; you need to do an OTA from OxygenOS 5.1.5 to 5.1.6!"
-
-# Android
-(mount | grep -q /system || mount /system) || abort 5 "Couldn't mount /system!"
-if [ `cat /system/build.prop | grep lineage.build.version= | cut -d'=' -f2` != "$TARGET_LOS_VER" ]; then
-	if [ ! -f /tmp/sfos_flash_confirm ]; then
-		touch /tmp/sfos_flash_confirm
-		abort 6 "If you don't know what you're doing: please factory reset & dirty flash LineageOS $TARGET_LOS_VER before this zip. Otherwise reflash again to confirm force flashing of SFOS."
-	fi
-	log "About to perform forced flash of SFOS"
-fi
-[ -f /system/bin/toybox ] || abort 8 "Your ROM doesn't ship with toybox; extracting of SFOS rootfs isn't possible!"
 if [ -f $ROOT/etc/os-release ]; then
 	if [ ! -f /tmp/sfos_fresh_confirm ]; then
 		touch /tmp/sfos_fresh_confirm
@@ -129,32 +108,13 @@ mkdir -p $FILES/
 unzip -o "$ZIPFILE" -x META-INF/* -d $FILES/
 
 log "Extracting SFOS rootfs..."
-ARCHIVE="$FILES/sfos-rootfs.tar.bz2"
+ARCHIVE_BZ="$FILES/sfos-rootfs.tar.bz2"
+ARCHIVE="$FILES/sfos-rootfs.tar"
 rm -rf $ROOT/
 mkdir -p $ROOT/
-/system/bin/toybox tar -xj -f $ARCHIVE -C $ROOT/ || abort 10 "Couldn't extract SFOS rootfs!"
+$FILES/bzip2 -dk $ARCHIVE_BZ
+tar --numeric-owner -xf $ARCHIVE -C $ROOT/ || abort 10 "Couldn't extract SFOS rootfs!"
 rm $ARCHIVE
-
-log "Fixing up init scripts..."
-sed -e "/extraenv/s/^/#/g" -e "/import \/init.\${ro.hardware}.rc/s/^/#/" -e "/ro.zygote/s/^/#/g" -e "/start update_verifier/s/^/#/g" \
-    -e "s/\/cpus\ /\/cpuset.cpus /g" -e "s/\/cpus$/\/cpuset.cpus/g" -e "s/\/mems\ /\/cpuset.mems /g" -e "s/\/mems$/\/cpuset.mems/g" \
-    -i $ROOT/init.rc || log "Couldn't fix-up init script!"
-rm $ROOT/init.extraenv.armeabi-v7a.rc
-
-log "Disabling forced encryption in vendor fstab..."
-(umount /vendor &> /dev/null; mount -o rw /vendor && sed "s/fileencryption/encryptable/" -i /vendor/etc/fstab.qcom) || log "Couldn't disable forced encryption!"
-umount /vendor &
-
-if [[ "$TARGET_LOS_VER" = "16.0" && ! -f $ROOT/lib/systemd/system/mnt-vendor-persist.mount ]]; then
-	log "Mount unit for persist not found; copying current /persist to rootfs..."
-	mkdir -p $ROOT/mnt/vendor/persist /persist
-	if mount $PARTITION_PERSIST /persist; then
-		cp -a /persist/ $ROOT/mnt/vendor/
-		umount /persist
-	else
-		log "Couldn't mount $PARTITION_PERSIST! Skipping copying..."
-	fi
-fi
 
 if [ "$FORCE_REINSTALL" = "0" ]; then
 	log "Backing up droid-boot image..."
@@ -166,8 +126,12 @@ fi
 
 log "Writing hybris-boot image..."
 dd if=$ROOT/boot/hybris-boot.img of=$PARTITION_BOOT bs=4m || abort 11 "Couldn't write Hybris boot image!"
+log "Writing dtbo image..."
+dd if=$ROOT/boot/dtbo.img of=$PARTITION_DTBO bs=4m || abort 11 "Couldn't write dtbo image!"
 
 log "Symlinking boot images to /sdcard..."
+cp $FILES/dtbo.img $ROOT/boot/
+ln -s $ROOT/boot/dtbo.img /sdcard/
 ln -s $ROOT/boot/droid-boot.img /sdcard/
 ln -s $ROOT/boot/hybris-boot.img /sdcard/
 
